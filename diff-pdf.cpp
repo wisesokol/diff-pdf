@@ -52,6 +52,10 @@ bool g_mark_differences = false;
 long g_channel_tolerance = 0;
 long g_per_page_pixel_tolerance = 0;
 bool g_grayscale = false;
+// --binary=N: if N > 0, pages are binarized and small differences inside
+// each block (of a fixed grid over the page) are ignored if the number of
+// differing pixels per block does not exceed N.
+long g_binary = 0;
 // Resolution to use for rasterization, in DPI
 #define DEFAULT_RESOLUTION 300
 long g_resolution = DEFAULT_RESOLUTION;
@@ -59,6 +63,41 @@ long g_resolution = DEFAULT_RESOLUTION;
 inline unsigned char to_grayscale(unsigned char r, unsigned char g, unsigned char b)
 {
     return (unsigned char)(0.2126 * r + 0.7152 * g + 0.0722 * b);
+}
+
+// Convert a rendered page surface to pure black & white (no grayscale),
+// using a simple global luminance threshold.
+static void binarize_surface(cairo_surface_t *surface)
+{
+    if ( !surface )
+        return;
+
+    cairo_surface_flush(surface);
+
+    const int width  = cairo_image_surface_get_width(surface);
+    const int height = cairo_image_surface_get_height(surface);
+    const int stride = cairo_image_surface_get_stride(surface);
+    unsigned char *data = cairo_image_surface_get_data(surface);
+
+    for ( int y = 0; y < height; ++y )
+    {
+        unsigned char *row = data + y * stride;
+        for ( int x = 0; x < width * 4; x += 4 )
+        {
+            unsigned char r = row[x + 0];
+            unsigned char g = row[x + 1];
+            unsigned char b = row[x + 2];
+
+            unsigned char gray = to_grayscale(r, g, b);
+            unsigned char v = gray >= 128 ? 255 : 0;
+
+            row[x + 0] = v;
+            row[x + 1] = v;
+            row[x + 2] = v;
+        }
+    }
+
+    cairo_surface_mark_dirty(surface);
 }
 
 cairo_surface_t *render_page(PopplerPage *page)
@@ -91,6 +130,11 @@ cairo_surface_t *render_page(PopplerPage *page)
     cairo_show_page(cr);
 
     cairo_destroy(cr);
+
+    // Optionally convert the rendered page to pure black & white to
+    // get sharp, thresholded edges before comparison.
+    if ( g_binary )
+        binarize_surface(surface);
 
     return surface;
 }
@@ -185,72 +229,325 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
     // to see if there are any differences:
     if ( s2 )
     {
-        unsigned char *out = datadiff + r2.y * stridediff + r2.x * 4;
-        for ( int y = 0;
-              y < r2.height;
-              y++, data2 += stride2, out += stridediff )
+        // If --binary=N with N > 0 is used, we treat pages as binarized
+        // and apply a per-block tolerance: the page is divided into a
+        // fixed grid of blocks (total 200), and if the number of differing
+        // pixels inside a block is <= N, that block is considered equal
+        // and is not highlighted.
+        if ( g_binary > 0 )
         {
-            bool linediff = false;
+            const int BLOCKS_X = 20;
+            const int BLOCKS_Y = 10;
+            const int BLOCK_COUNT = BLOCKS_X * BLOCKS_Y;
 
-            for ( int x = 0; x < r2.width * 4; x += 4 )
+            long block_diff[BLOCK_COUNT];
+            bool block_significant[BLOCK_COUNT];
+            for ( int i = 0; i < BLOCK_COUNT; ++i )
             {
-                unsigned char cr1 = *(out + x + 0);
-                unsigned char cg1 = *(out + x + 1);
-                unsigned char cb1 = *(out + x + 2);
+                block_diff[i] = 0;
+                block_significant[i] = false;
+            }
 
-                unsigned char cr2 = *(data2 + x + 0);
-                unsigned char cg2 = *(data2 + x + 1);
-                unsigned char cb2 = *(data2 + x + 2);
-
-                if ( cr1 > (cr2+g_channel_tolerance) || cr1 < (cr2-g_channel_tolerance)
-                  || cg1 > (cg2+g_channel_tolerance) || cg1 < (cg2-g_channel_tolerance)
-                  || cb1 > (cb2+g_channel_tolerance) || cb1 < (cb2-g_channel_tolerance)
-                   )
+            // First pass: count differing pixels per block
+            const unsigned char *d2 = data2;
+            unsigned char *out = datadiff + r2.y * stridediff + r2.x * 4;
+            for ( int y = 0;
+                  y < r2.height;
+                  y++, d2 += stride2, out += stridediff )
+            {
+                for ( int x = 0; x < r2.width * 4; x += 4 )
                 {
-                    pixel_diff_count++;
-                    changes = true;
-                    linediff = true;
+                    unsigned char cr1 = *(out + x + 0);
+                    unsigned char cg1 = *(out + x + 1);
+                    unsigned char cb1 = *(out + x + 2);
 
-                    if ( thumbnail )
+                    unsigned char cr2 = *(d2 + x + 0);
+                    unsigned char cg2 = *(d2 + x + 1);
+                    unsigned char cb2 = *(d2 + x + 2);
+
+                    bool pixel_diff =
+                        ( cr1 > (cr2+g_channel_tolerance) || cr1 < (cr2-g_channel_tolerance)
+                       || cg1 > (cg2+g_channel_tolerance) || cg1 < (cg2-g_channel_tolerance)
+                       || cb1 > (cb2+g_channel_tolerance) || cb1 < (cb2-g_channel_tolerance) );
+
+                    // Дополнительная логика для binary: если рядом (в окне +-3)
+                    // найдётся похожий пиксель во втором изображении, считаем этот
+                    // пиксель совпадающим и не увеличиваем счётчик блока.
+                    if ( pixel_diff )
                     {
-                        // calculate the coordinates in the thumbnail
-                        int tx = int((r2.x + x/4.0) * thumbnail_scale);
-                        int ty = int((r2.y + y) * thumbnail_scale);
+                        bool neighbour_match = false;
+                        const int px = x / 4;
 
-                        // Limit the coordinates to the thumbnail size (may be
-                        // off slightly due to rounding errors).
-                        // See https://github.com/vslavik/diff-pdf/pull/58
-                        tx = std::min(tx, thumbnail_width - 1);
-                        ty = std::min(ty, thumbnail_height - 1);
+                        for ( int dy = -3; dy <= 3 && !neighbour_match; ++dy )
+                        {
+                            int yy = y + dy;
+                            if ( yy < 0 || yy >= r2.height )
+                                continue;
 
-                        // mark changes with red
-                        thumbnail->SetRGB(tx, ty, 255, 0, 0);
+                            const unsigned char *row2n = data2 + yy * stride2;
+
+                            for ( int dx = -3; dx <= 3; ++dx )
+                            {
+                                int xx = px + dx;
+                                if ( xx < 0 || xx >= r2.width )
+                                    continue;
+
+                                const unsigned char *p2n = row2n + xx * 4;
+
+                                unsigned char nr2 = p2n[0];
+                                unsigned char ng2 = p2n[1];
+                                unsigned char nb2 = p2n[2];
+
+                                if ( !(cr1 > (nr2+g_channel_tolerance) || cr1 < (nr2-g_channel_tolerance)
+                                    || cg1 > (ng2+g_channel_tolerance) || cg1 < (ng2-g_channel_tolerance)
+                                    || cb1 > (nb2+g_channel_tolerance) || cb1 < (nb2-g_channel_tolerance)) )
+                                {
+                                    neighbour_match = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if ( !neighbour_match )
+                        {
+                            // Global pixel coordinates within the union rect
+                            int gx = r2.x + x/4;
+                            int gy = r2.y + y;
+
+                            if ( gx >= 0 && gx < rdiff.width &&
+                                 gy >= 0 && gy < rdiff.height )
+                            {
+                                int bx = gx * BLOCKS_X / rdiff.width;
+                                int by = gy * BLOCKS_Y / rdiff.height;
+                                if ( bx < 0 ) bx = 0;
+                                if ( bx >= BLOCKS_X ) bx = BLOCKS_X - 1;
+                                if ( by < 0 ) by = 0;
+                                if ( by >= BLOCKS_Y ) by = BLOCKS_Y - 1;
+
+                                int bi = by * BLOCKS_X + bx;
+                                if ( bi >= 0 && bi < BLOCK_COUNT )
+                                    block_diff[bi]++;
+                            }
+                        }
                     }
-                }
-
-                if (g_grayscale)
-                {
-                    // convert both images to grayscale, use blue for s1, red for s2
-                    unsigned char gray1 = to_grayscale(cr1, cg1, cb1);
-                    unsigned char gray2 = to_grayscale(cr2, cg2, cb2);
-                    *(out + x + 0) = gray2;
-                    *(out + x + 1) = (gray1 + gray2) / 2;
-                    *(out + x + 2) = gray1;
-                }
-                else
-                {
-                    // change the B channel to be from s2; RG will be s1
-                    *(out + x + 2) = cb2;
                 }
             }
 
-            if (g_mark_differences && linediff)
+            // Decide which blocks are significant and compute total diff count
+            pixel_diff_count = 0;
+            for ( int i = 0; i < BLOCK_COUNT; ++i )
             {
-                for (int x = 0; x < (10 < r2.width ? 10 : r2.width) * 4; x+=4)
+                if ( block_diff[i] > g_binary )
                 {
-                   *(out + x + 0) = 0;
-                   *(out + x + 1) = 0;
-                   *(out + x + 2) = 255;
+                    block_significant[i] = true;
+                    pixel_diff_count += block_diff[i];
+                }
+            }
+            if ( pixel_diff_count > 0 )
+                changes = true;
+
+            // Second pass: produce the visual diff and thumbnail marks,
+            // but only for pixels in significant blocks.
+            d2 = data2;
+            out = datadiff + r2.y * stridediff + r2.x * 4;
+            for ( int y = 0;
+                  y < r2.height;
+                  y++, d2 += stride2, out += stridediff )
+            {
+                bool linediff = false;
+
+                for ( int x = 0; x < r2.width * 4; x += 4 )
+                {
+                    unsigned char cr1 = *(out + x + 0);
+                    unsigned char cg1 = *(out + x + 1);
+                    unsigned char cb1 = *(out + x + 2);
+
+                    unsigned char cr2 = *(d2 + x + 0);
+                    unsigned char cg2 = *(d2 + x + 1);
+                    unsigned char cb2 = *(d2 + x + 2);
+
+                    // Global pixel coordinates for block mapping
+                    int gx = r2.x + x/4;
+                    int gy = r2.y + y;
+                    int bi = -1;
+                    if ( gx >= 0 && gx < rdiff.width &&
+                         gy >= 0 && gy < rdiff.height )
+                    {
+                        int bx = gx * BLOCKS_X / rdiff.width;
+                        int by = gy * BLOCKS_Y / rdiff.height;
+                        if ( bx < 0 ) bx = 0;
+                        if ( bx >= BLOCKS_X ) bx = BLOCKS_X - 1;
+                        if ( by < 0 ) by = 0;
+                        if ( by >= BLOCKS_Y ) by = BLOCKS_Y - 1;
+
+                        bi = by * BLOCKS_X + bx;
+                    }
+
+                    bool pixel_diff =
+                        ( cr1 > (cr2+g_channel_tolerance) || cr1 < (cr2-g_channel_tolerance)
+                       || cg1 > (cg2+g_channel_tolerance) || cg1 < (cg2-g_channel_tolerance)
+                       || cb1 > (cb2+g_channel_tolerance) || cb1 < (cb2-g_channel_tolerance) );
+
+                    if ( pixel_diff )
+                    {
+                        bool neighbour_match = false;
+                        const int px = x / 4;
+
+                        for ( int dy = -3; dy <= 3 && !neighbour_match; ++dy )
+                        {
+                            int yy = y + dy;
+                            if ( yy < 0 || yy >= r2.height )
+                                continue;
+
+                            const unsigned char *row2n = data2 + yy * stride2;
+
+                            for ( int dx = -3; dx <= 3; ++dx )
+                            {
+                                int xx = px + dx;
+                                if ( xx < 0 || xx >= r2.width )
+                                    continue;
+
+                                const unsigned char *p2n = row2n + xx * 4;
+
+                                unsigned char nr2 = p2n[0];
+                                unsigned char ng2 = p2n[1];
+                                unsigned char nb2 = p2n[2];
+
+                                if ( !(cr1 > (nr2+g_channel_tolerance) || cr1 < (nr2-g_channel_tolerance)
+                                    || cg1 > (ng2+g_channel_tolerance) || cg1 < (ng2-g_channel_tolerance)
+                                    || cb1 > (nb2+g_channel_tolerance) || cb1 < (nb2-g_channel_tolerance)) )
+                                {
+                                    neighbour_match = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if ( neighbour_match )
+                            pixel_diff = false;
+                    }
+
+                    bool use_pixel = pixel_diff &&
+                                     (bi >= 0 && bi < BLOCK_COUNT && block_significant[bi]);
+
+                    if ( use_pixel )
+                    {
+                        linediff = true;
+
+                        if ( thumbnail )
+                        {
+                            // calculate the coordinates in the thumbnail
+                            int tx = int((r2.x + x/4.0) * thumbnail_scale);
+                            int ty = int((r2.y + y) * thumbnail_scale);
+
+                            // Limit the coordinates to the thumbnail size (may be
+                            // off slightly due to rounding errors).
+                            // See https://github.com/vslavik/diff-pdf/pull/58
+                            tx = std::min(tx, thumbnail_width - 1);
+                            ty = std::min(ty, thumbnail_height - 1);
+
+                            // mark changes with red
+                            thumbnail->SetRGB(tx, ty, 255, 0, 0);
+                        }
+                    }
+
+                    if (g_grayscale)
+                    {
+                        // convert both images to grayscale, use blue for s1, red for s2
+                        unsigned char gray1 = to_grayscale(cr1, cg1, cb1);
+                        unsigned char gray2 = to_grayscale(cr2, cg2, cb2);
+                        *(out + x + 0) = gray2;
+                        *(out + x + 1) = (gray1 + gray2) / 2;
+                        *(out + x + 2) = gray1;
+                    }
+                    else
+                    {
+                        // change the B channel to be from s2; RG will be s1
+                        *(out + x + 2) = cb2;
+                    }
+                }
+
+                if (g_mark_differences && linediff)
+                {
+                    for (int x = 0; x < (10 < r2.width ? 10 : r2.width) * 4; x+=4)
+                    {
+                       *(out + x + 0) = 0;
+                       *(out + x + 1) = 0;
+                       *(out + x + 2) = 255;
+                    }
+                }
+            }
+        }
+        else // g_binary == 0, original behaviour
+        {
+            const unsigned char *d2 = data2;
+            unsigned char *out = datadiff + r2.y * stridediff + r2.x * 4;
+            for ( int y = 0;
+                  y < r2.height;
+                  y++, d2 += stride2, out += stridediff )
+            {
+                bool linediff = false;
+
+                for ( int x = 0; x < r2.width * 4; x += 4 )
+                {
+                    unsigned char cr1 = *(out + x + 0);
+                    unsigned char cg1 = *(out + x + 1);
+                    unsigned char cb1 = *(out + x + 2);
+
+                    unsigned char cr2 = *(d2 + x + 0);
+                    unsigned char cg2 = *(d2 + x + 1);
+                    unsigned char cb2 = *(d2 + x + 2);
+
+                    if ( cr1 > (cr2+g_channel_tolerance) || cr1 < (cr2-g_channel_tolerance)
+                      || cg1 > (cg2+g_channel_tolerance) || cg1 < (cg2-g_channel_tolerance)
+                      || cb1 > (cb2+g_channel_tolerance) || cb1 < (cb2-g_channel_tolerance)
+                       )
+                    {
+                        pixel_diff_count++;
+                        changes = true;
+                        linediff = true;
+
+                        if ( thumbnail )
+                        {
+                            // calculate the coordinates in the thumbnail
+                            int tx = int((r2.x + x/4.0) * thumbnail_scale);
+                            int ty = int((r2.y + y) * thumbnail_scale);
+
+                            // Limit the coordinates to the thumbnail size (may be
+                            // off slightly due to rounding errors).
+                            // See https://github.com/vslavik/diff-pdf/pull/58
+                            tx = std::min(tx, thumbnail_width - 1);
+                            ty = std::min(ty, thumbnail_height - 1);
+
+                            // mark changes with red
+                            thumbnail->SetRGB(tx, ty, 255, 0, 0);
+                        }
+                    }
+
+                    if (g_grayscale)
+                    {
+                        // convert both images to grayscale, use blue for s1, red for s2
+                        unsigned char gray1 = to_grayscale(cr1, cg1, cb1);
+                        unsigned char gray2 = to_grayscale(cr2, cg2, cb2);
+                        *(out + x + 0) = gray2;
+                        *(out + x + 1) = (gray1 + gray2) / 2;
+                        *(out + x + 2) = gray1;
+                    }
+                    else
+                    {
+                        // change the B channel to be from s2; RG will be s1
+                        *(out + x + 2) = cb2;
+                    }
+                }
+
+                if (g_mark_differences && linediff)
+                {
+                    for (int x = 0; x < (10 < r2.width ? 10 : r2.width) * 4; x+=4)
+                    {
+                       *(out + x + 0) = 0;
+                       *(out + x + 1) = 0;
+                       *(out + x + 2) = 255;
+                    }
                 }
             }
         }
@@ -903,6 +1200,10 @@ int main(int argc, char *argv[])
                   "g", "grayscale", "only differences will be in color, unchanged parts will show as gray" },
 
         { wxCMD_LINE_OPTION,
+                  NULL, "binary", "binarize pages and ignore small differences inside each of 200 blocks if their pixel count does not exceed this threshold (0 = disabled)",
+                  wxCMD_LINE_VAL_NUMBER },
+
+        { wxCMD_LINE_OPTION,
                   NULL, "output-diff", "output differences to given PDF file",
                   wxCMD_LINE_VAL_STRING },
 
@@ -954,6 +1255,15 @@ int main(int argc, char *argv[])
 
     if ( parser.Found("grayscale") )
         g_grayscale = true;
+
+    if ( parser.Found("binary", &g_binary) )
+    {
+        if ( g_binary < 0 )
+        {
+            fprintf(stderr, "Invalid binary value: %ld. Valid range is 0 (disabled) or a positive per-block pixel tolerance.\n", g_binary);
+            return 2;
+        }
+    }
 
     wxFileName file1(parser.GetParam(0));
     wxFileName file2(parser.GetParam(1));
