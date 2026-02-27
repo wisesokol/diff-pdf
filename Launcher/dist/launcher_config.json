@@ -1,0 +1,6 @@
+{
+  "program_path": "C:/Users/User/Desktop/diff-pdf-binary/diff-pdf.exe",
+  "args": "--binary=5 --view",
+  "file1": "C:/Users/User/Desktop/PDF2Searchable/0100.pdf",
+  "file2": "C:/Users/User/Desktop/diff-pdf-binary/2.pdf"
+}
